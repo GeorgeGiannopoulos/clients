@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ==================================================================================================
 #
 @contextmanager
-def subscriber(client: RabbitMQClient):
+def subscriber(client: RabbitMQClient, exit_on_failure: bool = False):
     """A wrapper manager for subscription"""
     try:
         logger.info('Starting rabbitMQ client...')
@@ -42,24 +42,26 @@ def subscriber(client: RabbitMQClient):
         logger.info('Start Consuming...')
         client.run()
     except KeyboardInterrupt:
+        raise KeyboardInterrupt() from None
+    except Exception as e:
+        logger.exception(e)
+    finally:
         logger.info("Prepare to terminate rabbitMQ client gracefully...")
         logger.info('Stop Consuming...')
         client.stop()
         logger.info('Disconnect rabbitMQ client')
         client.disconnect()
         # Shutdown eventually
-        logger.info("Exiting...")
-        try:
-            sys.exit(0)
-        except SystemExit:
-            os._exit(0)
-    except Exception as e:
-        logger.exception(e)
-
+        if exit_on_failure:
+            logger.info("Exiting...")
+            try:
+                sys.exit(1)
+            except:
+                os._exit(1)
 
 
 @contextmanager
-def publiser(client: RabbitMQClient):
+def publisher(client: RabbitMQClient):
     """A wrapper manager for publication"""
     try:
         logger.info('Starting rabbitMQ client...')
@@ -67,7 +69,7 @@ def publiser(client: RabbitMQClient):
         client.connect()
         yield client.channel
     except KeyboardInterrupt:
-        pass
+        raise KeyboardInterrupt() from None
     except Exception as e:
         logger.exception(e)
     finally:
@@ -217,14 +219,45 @@ class Subscriber:
             self._directs.extend(_subscription._directs)
             self._topics.extend(_subscription._topics)
 
-    def run(self):
+    def run(self, exit_on_failure: bool=False):
         """Start processing subscriptions by running the RabbitMQ client."""
-        with subscriber(self._client) as channel:
+        with subscriber(self._client, exit_on_failure) as channel:
             for directly in self._directly:
-                self._client.receive_from(channel, directly.queue, directly.callback, **directly.kwargs)
+                self._client.receive_from(channel, directly.queue, directly.callback,
+                                          connection=self._client.connection, **directly.kwargs)
             for broadcast in self._broadcasts:
-                self._client.from_broadcast(channel, broadcast.exchange, broadcast.callback, **broadcast.kwargs)
+                self._client.from_broadcast(channel, broadcast.exchange, broadcast.callback,
+                                            connection=self._client.connection, **broadcast.kwargs)
             for direct in self._directs:
-                self._client.from_direct(channel, direct.exchange, direct.routing, direct.callback, **direct.kwargs)
+                self._client.from_direct(channel, direct.exchange, direct.routing, direct.callback,
+                                         connection=self._client.connection, **direct.kwargs)
             for topic in self._topics:
-                self._client.from_topic(channel, topic.exchange, topic.routing, topic.callback, **topic.kwargs)
+                self._client.from_topic(channel, topic.exchange, topic.routing, topic.callback,
+                                        connection=self._client.connection, **topic.kwargs)
+
+
+# ==================================================================================================
+# Functions
+# ==================================================================================================
+def callback_logger(ch, method, properties, body, tracking_id: str = None, message: str=None, level=logging.INFO):
+    try:
+        # Tracking ID
+        tracking_id = f"{tracking_id} " if tracking_id else ''
+        # Μessage
+        message = f" {message}" if message else ''
+        # Identity info
+        consumer_tag = getattr(method, 'consumer_tag', '-')
+        delivery_tag = getattr(method, 'delivery_tag', '-')
+        # Delivery path info
+        exchange = getattr(method, 'exchange', '-')
+        routing_key = getattr(method, 'routing_key', '-')
+        queue = getattr(method, 'queue', '-')
+        destination = f"{exchange} > {routing_key} > {queue}"
+        # Delivery properties info
+        delivery_mode = getattr(properties, 'delivery_mode', '-')
+
+        msg = f"{tracking_id}{consumer_tag} {delivery_tag} '{destination}'{message}"
+    except:
+        level = logging.ERROR
+        msg = 'Failed to log for this delivery!'
+    logger.log(level, msg)

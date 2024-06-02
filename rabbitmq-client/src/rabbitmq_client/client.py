@@ -10,9 +10,12 @@
 # Imports
 # ==================================================================================================
 # Build-in
+import ssl
 import time
 import logging
+from threading import Thread
 from typing import Union, List
+from functools import wraps, partial
 # Installed
 import pika
 from pika.credentials import PlainCredentials
@@ -27,19 +30,70 @@ logger = logging.getLogger(__name__)
 
 
 # ==================================================================================================
+# Decorators
+# ==================================================================================================
+#
+def threaded(f):
+    """This function runs a function in a separate thread"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        thread = Thread(target=f, args=args, kwargs=kwargs)
+        thread.start()
+    return wrapper
+
+
+# ==================================================================================================
+# Functions
+# ==================================================================================================
+@threaded
+def callback_threaded(func, ch, method, properties, body, connection):
+    """This function runs a callback in a separate thread to solve the long running task problem,
+       where the heartbeat is not send because the main thread is blocked with the callback.
+       It runs the function and sends the ACK manually using the thread safe function
+    """
+    logger.info(f"{func.__name__} running in a separate thread")
+    func(ch, method, properties, body)
+    cb = partial(RabbitMQClient.ack_message, ch, method.delivery_tag)
+    connection.add_callback_threadsafe(cb)
+
+
+def is_callback_threaded(callback, threaded, ack, **kwargs):
+    """This function converts a callback function to threaded one"""
+    # Extract the the connection either way, because in case the Subscriber class is given, then it
+    # is always given. Remove it so does not send as argument to pika's library functions
+    connection = kwargs.pop('connection', None)
+    # If threaded argument is True the set ACK to False so it sent manually
+    if threaded:
+        # Always change ACK to False in threaded callback
+        ack = False
+        if connection is None:
+            raise Exception('Callback cannot run in a separate thread because the connection not given!')
+        callback = partial(callback_threaded, callback, connection=connection)
+    return callback, ack, kwargs
+
+
+# ==================================================================================================
 # Classes
 # ==================================================================================================
 #
 class RabbitMQClient:
 
-    def __init__(self, host, port=5672, username=None, password=None):
+    def __init__(self, host, port, username=None, password=None, verbose: bool = True):
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.ssl_options = None
+        # If port is SSL one then connect with SSL enabled
+        if self.port == 5671:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+            self.ssl_options = pika.SSLOptions(context)
         self.connection = None
         self.channel = None
         self.connected = False
+        if not verbose:
+            self.verbose = verbose
+            logging.getLogger('pika').setLevel(logging.WARNING)
 
     # -------------------------------------
     # Connections
@@ -49,10 +103,12 @@ class RabbitMQClient:
         max_retries, attempts = 3, 0
         while not self.connected and attempts < max_retries:
             try:
-                self.connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=self.host,
-                                              port=self.port,
-                                              credentials=PlainCredentials(self.username, self.password)))
+                credentials=PlainCredentials(self.username, self.password)
+                connection_parameters = pika.ConnectionParameters(host=self.host,
+                                                                  port=self.port,
+                                                                  credentials=credentials,
+                                                                  ssl_options=self.ssl_options)
+                self.connection = pika.BlockingConnection(connection_parameters)
                 self.channel = self.connection.channel()
                 self.connected = True
                 break
@@ -67,7 +123,8 @@ class RabbitMQClient:
     def disconnect(self):
         """Disconnects from the RabbitMQ server"""
         if self.is_connected():
-            self.channel.close()
+            if self.channel.is_open:
+                self.channel.close()
             self.connection.close()
             self.connected = False
 
@@ -83,15 +140,17 @@ class RabbitMQClient:
     def run(self):
         """Starts consuming messages from subscribed queues"""
         if self.is_connected():
-            try:
-                self.channel.start_consuming()
-            except KeyboardInterrupt:
-                self.channel.stop_consuming()
+            self.channel.start_consuming()
 
     def stop(self):
         """Stops consuming messages from subscribed queues"""
         if self.is_connected():
             self.channel.stop_consuming()
+
+    def heartbeat(self):
+        """Sends a forced heartbeat to the broker"""
+        # NOTE: Use this function in case of a long running publisher
+        self.connection.process_data_events(time_limit=1)
 
     def terminate(self):
         """Steps and disconnects this client"""
@@ -101,6 +160,19 @@ class RabbitMQClient:
     # -------------------------------------
     # Messaging
     # -------------------------------------
+    @staticmethod
+    def ack_message(channel, delivery_tag):
+        """Send manually an ACK to the broker
+        NOTE: Channel must be the same pika channel instance via which the message being ACKed was
+              retrieved (AMQP protocol constraint).
+        """
+        if channel.is_open:
+            channel.basic_ack(delivery_tag)
+        else:
+            # Channel is already closed, so we can't ACK this message;
+            # log and/or do something that makes sense for your app in this case.
+            pass
+
     #
     # Sent Messages
     #
@@ -197,7 +269,8 @@ class RabbitMQClient:
     # Receive Messages
     #
     @staticmethod
-    def receive_from(channel, queue: str, callback, ack: bool = True, durable: bool = False, **kwargs):
+    def receive_from(channel, queue: str, callback, ack: bool = True, durable: bool = False,
+                     threaded: bool = False, **kwargs):
         """Receives messages from queues directly
             - By default, it operates using Round-Robin dispatching.
             - if 'ack=True' then add 'ch.basic_ack(delivery_tag=method.delivery_tag)' and the end of the
@@ -209,20 +282,27 @@ class RabbitMQClient:
         callback (function): An iteration function of the model
         ack (boolean): If True, disables manual message acknowledgments [Default: True]
         durable (boolean): If True, the broker will not remove the queue in case of a restart
+        threaded (boolean): If True, runs the callback in a separate threat. It is recommends for
+                            long running tasks [Default: false]
 
         Usage examples
         --------------
         >>> .receive_from(ch, 'logs', fun)
         """
+        # Check if callback should run in a separate threat
+        callback, ack, kwargs = is_callback_threaded(callback, threaded, ack, **kwargs)
+
         if queue is None or queue == '':
             raise Exception('In direct exchange, queues must be named!')
         channel.queue_declare(queue=queue, durable=durable)
         channel.basic_consume(queue=queue, on_message_callback=callback, auto_ack=ack, **kwargs)
+        logger.info(f"Subscribe directly to queue '{queue}'")
 
     @staticmethod
-    def from_broadcast(channel, exchange: str, callback, ack: bool = True, **kwargs):
+    def from_broadcast(channel, exchange: str, callback, ack: bool = True, threaded: bool = False, **kwargs):
         """Receives messages from broadcasted exchanges
             - By default the queue is exclusive to the exchange so the name is a random one
+            - if 'ack=True' then add 'ch.basic_ack(delivery_tag=method.delivery_tag)' and the end of the
 
         Parameters
         ----------
@@ -230,21 +310,29 @@ class RabbitMQClient:
         exchange (str): The name of the exchange that broadcasts the messages to be consumed
         callback (function): An iteration function of the model
         ack (boolean): If True, disables manual message acknowledgments [Default: True]
+        threaded (boolean): If True, runs the callback in a separate threat. It is recommends for
+                            long running tasks [Default: false]
 
         Usage examples
         --------------
         >>> .from_broadcast(ch, 'logs', fun)
         """
+        # Check if callback should run in a separate threat
+        callback, ack, kwargs = is_callback_threaded(callback, threaded, ack, **kwargs)
+
         if exchange is None or exchange == '':
             raise Exception('In fanout, exchange must be named!')
         channel.exchange_declare(exchange=exchange, exchange_type='fanout')
         queue = channel.queue_declare(queue='', exclusive=True)
         channel.queue_bind(exchange=exchange, queue=queue.method.queue)
         channel.basic_consume(queue=queue.method.queue, on_message_callback=callback, auto_ack=ack, **kwargs)
+        logger.info(f"Subscribe to broadcast exchange '{exchange}'")
 
     @staticmethod
-    def from_direct(channel, exchange: str, routing: Union[str, List[str]], callback, ack: bool = True, **kwargs):
+    def from_direct(channel, exchange: str, routing: Union[str, List[str]], callback, ack: bool = True,
+                    threaded: bool = False, **kwargs):
         """Receives messages from multiple routes
+            - if 'ack=True' then add 'ch.basic_ack(delivery_tag=method.delivery_tag)' and the end of the
 
         Parameters
         ----------
@@ -253,21 +341,29 @@ class RabbitMQClient:
         routing (list(str)): A list of all the routes to listen to
         callback (function): An iteration function of the model
         ack (boolean): If True, disables manual message acknowledgments [Default: True]
+        threaded (boolean): If True, runs the callback in a separate threat. It is recommends for
+                            long running tasks [Default: false]
 
         Usage examples
         --------------
         >>> .from_direct(ch, 'logs', 'critical', fun)
         """
+        # Check if callback should run in a separate threat
+        callback, ack, kwargs = is_callback_threaded(callback, threaded, ack, **kwargs)
+
         channel.exchange_declare(exchange=exchange, exchange_type='direct')
         queue = channel.queue_declare(queue='', exclusive=True)
         routing = routing if isinstance(routing, list) else [routing]
         for r in routing:
             channel.queue_bind(exchange=exchange, queue=queue.method.queue, routing_key=r)
         channel.basic_consume(queue=queue.method.queue, on_message_callback=callback, auto_ack=ack, **kwargs)
+        logger.info(f"Subscribe to direct exchange '{exchange}' via routing '{routing}'")
 
     @staticmethod
-    def from_topic(channel, exchange: str, routing: Union[str, List[str]], callback, ack: bool = True, **kwargs):
+    def from_topic(channel, exchange: str, routing: Union[str, List[str]], callback, ack: bool = True,
+                   threaded: bool = False, **kwargs):
         """Receives messages from multiple topics
+            - if 'ack=True' then add 'ch.basic_ack(delivery_tag=method.delivery_tag)' and the end of the
 
         Parameters
         ----------
@@ -276,6 +372,8 @@ class RabbitMQClient:
         routing (list(str)): A list of all the routes to listen to
         callback (function): An iteration function of the model
         ack (boolean): If True, disables manual message acknowledgments [Default: True]
+        threaded (boolean): If True, runs the callback in a separate threat. It is recommends for
+                            long running tasks [Default: false]
 
         Usage examples
         --------------
@@ -283,12 +381,16 @@ class RabbitMQClient:
         >>> .from_topic(ch, 'logs', 'kernel.#', fun)
         >>> .from_topic(ch, 'logs', '*.critical.*', fun)
         """
+        # Check if callback should run in a separate threat
+        callback, ack, kwargs = is_callback_threaded(callback, threaded, ack, **kwargs)
+
         channel.exchange_declare(exchange=exchange, exchange_type='topic')
         queue = channel.queue_declare('', exclusive=True)
         routing = routing if isinstance(routing, list) else [routing]
         for r in routing:
             channel.queue_bind(exchange=exchange, queue=queue.method.queue, routing_key=r)
         channel.basic_consume(queue=queue.method.queue, on_message_callback=callback, auto_ack=ack, **kwargs)
+        logger.info(f"Subscribe to topic '{exchange}' via routing '{routing}'")
 
 
 class Singleton(type):
