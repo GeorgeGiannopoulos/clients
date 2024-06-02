@@ -29,6 +29,25 @@ logger = logging.getLogger(__name__)
 # Classes
 # ==================================================================================================
 #
+class Response:
+    """A class to manage requests responses"""
+
+    def __init__(self, response: requests.Response):
+        self.response = response
+
+    def json(self):
+        if self.response.status_code != 200:
+            _json = self.response.json()
+            message = _json.get('message') or _json.get('detail')
+            raise Exception(message)
+        return self.response.json()
+
+    def ok(self):
+        if 200 <= self.response.status_code < 300:
+            return True
+        return False
+
+
 class FileResponse:
     """Represents a response object for handling file downloads from HTTP requests.
 
@@ -37,7 +56,7 @@ class FileResponse:
     response (requests.Response): The response object obtained from a HTTP request.
     """
 
-    def __init__(self, response):
+    def __init__(self, response: requests.Response):
         self.response = response
 
     def file(self):
@@ -47,7 +66,7 @@ class FileResponse:
         -------
         str: The content of the file.
         """
-        return self.response.content.decode()
+        return self.response.content
 
     def save(self, path: str = None):
         """Save the response content to a file.
@@ -109,17 +128,24 @@ class FileResponse:
         return fname[0]
 
 
-class BucketClient:
+class APIClient:
+    """A class to interact with an HTTP API."""
+
+    def __init__(self, host: str, port: int = None, protocol: str = 'http'):
+        self.host = host
+        self.port = port
+        self.url = f"{protocol}://{host}:{port}" if port else f"{protocol}://{host}"
+
+
+class BucketClient(APIClient):
     """A simple client for interacting with an Bucket-like storage service.
 
     host (str): The host of the Bucket-like storage service.
     port (int): The port of the Bucket-like storage service.
     """
 
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.url = f"http://{host}:{port}"
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     def upload_file(self, filepath: str, **kwargs):
         """Upload multiple file to the storage service.
@@ -134,8 +160,7 @@ class BucketClient:
             response = requests.post(f"{self.url}/bucket/v1/file",
                                      files={"file": f},
                                      params=kwargs)
-            response.raise_for_status()  # Raise an exception for non-2xx status codes
-            return response.json()
+            return Response(response).json()
 
     def update_file(self, filepath: str, **kwargs):
         """Update a file in the storage service.
@@ -149,8 +174,20 @@ class BucketClient:
             response = requests.put(f"{self.url}/bucket/v1/file/{filename}",
                                     files={"file": f},
                                     params=kwargs)
-            response.raise_for_status()  # Raise an exception for non-2xx status codes
-            return response.json()
+            return Response(response).json()
+
+    def upsert_file(self, filepath: str, **kwargs):
+        """Upload or Update a file in the storage service.
+
+        Parameters
+        ----------
+        filepath (str): A path of the file object to uploaded or updated.
+        """
+        filename = os.path.basename(filepath)
+        if not self.check_file(filename):
+            return self.upload_file(filepath, **kwargs)
+        else:
+            return self.update_file(filepath, **kwargs)
 
     def get_file(self, filename: str):
         """Retrieve a file from the storage service.
@@ -164,6 +201,16 @@ class BucketClient:
         response.raise_for_status()  # Raise an exception for non-2xx status codes
         return FileResponse(response).is_downloadable()
 
+    def check_file(self, filename: str):
+        """Check if a file exists in the storage service.
+
+        Parameters
+        ----------
+        filename (str): The name of the file check.
+        """
+        response = requests.get(f"{self.url}/bucket/v1/file/{filename}/check")
+        return Response(response).ok()
+
     def delete_file(self, filename: str):
         """Delete a file from the storage service.
 
@@ -172,5 +219,4 @@ class BucketClient:
         filename (str): The name of the file to delete.
         """
         response = requests.delete(f"{self.url}/bucket/v1/file/{filename}")
-        response.raise_for_status()  # Raise an exception for non-2xx status codes
-        return response.json()
+        return Response(response).json()

@@ -1,8 +1,5 @@
 from setuptools import setup, find_packages
 
-VERSION = '0.0.1'
-PACKAGE_NAME = 'bucket-client'
-DESCRIPTION = 'A wrapper for a Storage Bucket client'
 with open('README.md', 'r', encoding='utf-8') as fh:
     LONG_DESCRIPTION = fh.read()
 with open('requirements.txt', 'r', encoding='utf-8') as rf:
@@ -29,11 +26,11 @@ with open('requirements.txt', 'r', encoding='utf-8') as rf:
             REQUIREMENTS.append(line)
 
 setup(
-    name=PACKAGE_NAME,
-    version=VERSION,
+    name='bucket-client',
+    version='0.0.1',
     author='CERTH',
     author_email='author@email.com',
-    description=DESCRIPTION,
+    description='A wrapper for a Storage Bucket client',
     long_description=LONG_DESCRIPTION,
     long_description_content_type='text/markdown',
     url='https://github.com/GeorgeGiannopoulos/clients/bucket-client.git',
