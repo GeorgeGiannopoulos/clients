@@ -1,0 +1,20 @@
+# IDE - VSCode
+.vscode/
+
+# IDE - JetBeans project files
+.idea/
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+
+# Setuptools distribution folder.
+dist/
+build/
+
+# Python egg metadata, regenerated from source files by setuptools.
+**/*.egg-info
+
+# Virtual Enviroment
+.venv
+venv
