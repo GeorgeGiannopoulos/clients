@@ -51,16 +51,20 @@
 import re
 import logging
 import datetime
+import warnings
 # Installed
 from influxdb_client import InfluxDBClient, Point, Dialect
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS, WriteOptions
+from influxdb_client.client.warnings import MissingPivotFunction
 # Custom
+# NOTE: Add her all the Custom modules
 
 
 # ==================================================================================================
 # Logging
 # ==================================================================================================
 logger = logging.getLogger(__name__)
+warnings.simplefilter("ignore", MissingPivotFunction)
 
 
 # ==================================================================================================
@@ -244,6 +248,71 @@ class InfluxQuery:
         self._query += f'\n |> yield(name: "{method}")'
         return self
 
+    def integral(self, column: str = '_value', unit: str = '1h', time_column: str = '_time', interpolate: str = ''):
+        """Computes the area under the curve per unit of time of subsequent non-null records.
+
+        Parameters
+        ----------
+        column (optional[str]): Column to operate on. Default is _value.
+        interpolate (optional[str]): Type of interpolation to use. Default is "".
+        timeColumn (optional[str]): Column that contains time values to use in the operation. Default is _time.
+        unit (optional[str]): Unit of time to use to compute the integral.
+        """
+        self._query += f'\n |> integral(column: "{column}", unit: {unit}, interpolate: "{interpolate}", timeColumn: "{time_column}")'
+        return self
+
+    def aggregate_window(self, every: str = '1h', fn: str = 'mean', create_empty: bool = True,
+                         time_source: str = '_stop'):
+        """Downsamples data by grouping data into fixed windows of time and applying an aggregate
+           or selector function to each window.
+
+        Parameters
+        ----------
+        every: (str): Duration of time between windows.
+        fn: (str): Aggregate or selector function to apply to each time window.
+        createEmpty (optional[str]): Create empty tables for empty window. Default is true.
+        column (optional[str]): Column to operate on. TODO: Add it when needed
+        location (optional[str]): Location used to determine timezone. Default is the location option. TODO: Add it when needed
+        offset (optional[str]): Duration to shift the window boundaries by. Default is 0s. TODO: Add it when needed
+        period (optional[str]): Duration of windows. Default is the every value. TODO: Add it when needed
+        timeDst (optional[str]): Column to store time values for aggregate values in. Default is _time. TODO: Add it when needed
+        timeSrc (optional[str]): Column to use as the source of the new time value for aggregate values. Default is _stop.
+        """
+
+        self._query += (f'\n |> aggregateWindow(every: {every}, fn: {fn},'
+                        f' createEmpty: {str(create_empty).lower()}, timeSrc: "{time_source}")')
+        return self
+
+    def window(self, every: str = '1h'):
+        """Groups records using regular time intervals.
+
+        Parameters
+        ----------
+        every: (str): Duration of time between windows.
+        """
+        self._query += f'\n |> window(every: {every})'
+        return self
+
+    def fill(self, use_previous: bool = False):
+        """Replaces all null values in input tables with a non-null value.
+
+        Parameters
+        ----------
+        use_previous (bool): Replace null values with the previous non-null value. Default is false.
+        """
+        self._query += f'\n |> fill(usePrevious: {str(use_previous).lower()})'
+        return self
+
+    def last(self):
+        """Returns the last row with a non-null value from each input table."""
+        self._query += f'\n |> last()'
+        return self
+
+    def first(self):
+        """Returns the first non-null record from each input table."""
+        self._query += f'\n |> first()'
+        return self
+
     def pivot(self):
         """Pivot data specific columns."""
         self._query += f'\n |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")'
@@ -310,8 +379,9 @@ class InfluxClient:
     # Query
     # -------------------------------------
     def query(self, bucket: str, measurement: str, fields: str | list = None, method: str = None,
-              start: str = None, end: str = None, past: str = None, pivot: bool = False,
-              keep: list = None, **tags):
+              start: str = None, end: str = None, past: str = None, integral: dict = None,
+              aggregate_window: dict = None, window: dict = None, fill: dict = None,
+              last: dict = None, first: dict = None, pivot: bool = False, keep: list = None, **tags):
         """ Build and execute a query.
 
         Parameters
@@ -323,6 +393,15 @@ class InfluxClient:
         start (optional[str]): The start time of the query range in ISO format.
         end (optional[str]): The end time of the query range in ISO format.
         past (optional[str]): Specify a past time range in minutes or days (e.g., '1h', '7d').
+        integral (optional[dict]): Computes the area under the curve per unit of time of subsequent
+                                   non-null records.
+        aggregate_window (optional[dict]): Downsamples data by grouping data into fixed windows of
+                                           time and applying an aggregate or selector function to
+                                           each window.
+        window (optional[dict]): Groups records using regular time intervals.
+        fill (optional[dict]): Replaces all null values in input tables with a non-null value.
+        last (optional[dict]): Returns the last row with a non-null value from each input table.
+        first (optional[dict]): Returns the first non-null record from each input table.
         pivot (optional[bool]): Whether to pivot the query result.
         keep (optional[list[str]]): List of fields to keep in pivot.
         **tags: Additional tags as tag-key pairs to filter by.
@@ -345,6 +424,18 @@ class InfluxClient:
         q = q.tags(**tags)
         if method:
             q = q.method(method)
+        if window is not None:
+            q = q.window(**window)
+        if integral is not None:
+            q = q.integral(**integral)
+        if aggregate_window is not None:
+            q = q.aggregate_window(**aggregate_window)
+        if fill is not None:
+            q = q.fill(**fill)
+        if last is not None:
+            q = q.last(**last)
+        if first is not None:
+            q = q.first(**first)
         if pivot:
             q = q.pivot()
             if keep:
@@ -354,7 +445,8 @@ class InfluxClient:
     # -------------------------------------
     # Read
     # -------------------------------------
-    def read(self, bucket: str, measurement: str, fields: str | list = None, method: str = None, format='line', **kwargs):
+    def read(self, bucket: str, measurement: str, fields: str | list = None, method: str = None,
+             format='line', pivot=False, **kwargs):
         """Read data from influxDB
 
         Parameters
@@ -364,7 +456,7 @@ class InfluxClient:
         fields (optional[str | list[str]]): A string or a list of string containing fields to filter by.
         method (optional[str]): The aggregated method to perform prior to fetching the data
         format (str): The format of the results data
-        **kwargs: Additional tags as tag-key pairs to filter by.
+        **kwargs: Additional tags as tag-key pairs to filter by and query parameters.
 
         Usage examples
         --------------
@@ -375,8 +467,13 @@ class InfluxClient:
         >>> .query(bucket='Forecast', measurement='SmartMeter', fields=['power', 'energy'],
                    past='30d', asset_id=['0000011'], variable_id=['M1'], method='mean', format='csv')
         """
-        pivot = True if format == 'dataframe' else False
-        query = self.query(bucket, measurement, fields, method, pivot=pivot, **kwargs)
+        # Control pivot argument
+        if format == 'dataframe':
+            if not any(fun in kwargs for fun in ['window', 'integral', 'interpolate', 'fill', 'last', 'first']):
+                pivot = True
+        kwargs['pivot'] = pivot
+        # Build query
+        query = self.query(bucket, measurement, fields, method, **kwargs)
         if format == 'dataframe':
             return self.query_api.query_data_frame(org=self.org, query=query)
         elif format == 'csv':
