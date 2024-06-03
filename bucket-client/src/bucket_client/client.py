@@ -155,6 +155,10 @@ class BucketClient(APIClient):
         filepath (str): A path of the file object to upload.
         unique (bool): The Bucket stores the file using a genarated name.
         metadata (bool): The Bucket returns file's metadata instead of filename.
+
+        Returns
+        -------
+        str | dict: The filename or the metadata of the file that was stored.
         """
         with open(filepath, "rb") as f:
             response = requests.post(f"{self.url}/bucket/v1/file",
@@ -168,6 +172,10 @@ class BucketClient(APIClient):
         Parameters
         ----------
         filepath (str): A path of the file object to updated.
+
+        Returns
+        -------
+        str | dict: The filename or the metadata of the file that was updated.
         """
         filename = os.path.basename(filepath)
         with open(filepath, "rb") as f:
@@ -182,6 +190,10 @@ class BucketClient(APIClient):
         Parameters
         ----------
         filepath (str): A path of the file object to uploaded or updated.
+
+        Returns
+        -------
+        str | dict: The filename or the metadata of the file that was stored/updated.
         """
         filename = os.path.basename(filepath)
         if not self.check_file(filename):
@@ -195,6 +207,10 @@ class BucketClient(APIClient):
         Parameters
         ----------
         filename (str): The name of the file to retrieve.
+
+        Returns
+        -------
+        file: The file stored in the storage service
         """
         response = requests.get(f"{self.url}/bucket/v1/file/{filename}",
                                 stream=True)  # Stream download for large files
@@ -207,6 +223,10 @@ class BucketClient(APIClient):
         Parameters
         ----------
         filename (str): The name of the file check.
+
+        Returns
+        -------
+        bool: True or False depending if the file is stored in the storage service.
         """
         response = requests.get(f"{self.url}/bucket/v1/file/{filename}/check")
         return Response(response).ok()
@@ -219,4 +239,20 @@ class BucketClient(APIClient):
         filename (str): The name of the file to delete.
         """
         response = requests.delete(f"{self.url}/bucket/v1/file/{filename}")
+        return Response(response).json()
+
+    def metadata_of_file(self, filename: str, info: str = None):
+        """Gets metadata of a file from the storage service.
+
+        Parameters
+        ----------
+        filename (str): The name of the file to get metadata of.
+        info (optional[str]): A specific property of metadata to return
+
+        Returns
+        -------
+        str | dict: The metadata or a property of them of a file stored in the storage service.
+        """
+        params = {'info': info} if info else {}
+        response = requests.get(f"{self.url}/bucket/v1/file/{filename}/metadata", params=params)
         return Response(response).json()
