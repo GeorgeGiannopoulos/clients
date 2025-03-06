@@ -42,15 +42,18 @@ def subscriber(client: RabbitMQClient, exit_on_failure: bool = False):
         logger.info('Start Consuming...')
         client.run()
     except KeyboardInterrupt:
+        yield None  # NOTE: yield should run at least once even in exception
         raise KeyboardInterrupt() from None
     except Exception as e:
-        logger.exception(e)
+        logger.error(e)
+        yield None  # NOTE: yield should run at least once even in exception
     finally:
-        logger.info("Prepare to terminate rabbitMQ client gracefully...")
-        logger.info('Stop Consuming...')
-        client.stop()
-        logger.info('Disconnect rabbitMQ client')
-        client.disconnect()
+        if client.is_connected():
+            logger.info("Prepare to terminate rabbitMQ client gracefully...")
+            logger.info('Stop Consuming...')
+            client.stop()
+            logger.info('Disconnect rabbitMQ client')
+            client.disconnect()
         # Shutdown eventually
         if exit_on_failure:
             logger.info("Exiting...")
@@ -69,13 +72,16 @@ def publisher(client: RabbitMQClient):
         client.connect()
         yield client.channel
     except KeyboardInterrupt:
+        yield None  # NOTE: yield should run at least once even in exception
         raise KeyboardInterrupt() from None
     except Exception as e:
-        logger.exception(e)
+        logger.error(e)
+        yield None  # NOTE: yield should run at least once even in exception
     finally:
-        logger.info("Prepare to terminate rabbitMQ client gracefully...")
-        logger.info('Disconnect rabbitMQ client')
-        client.disconnect()
+        if client.is_connected():
+            logger.info("Prepare to terminate rabbitMQ client gracefully...")
+            logger.info('Disconnect rabbitMQ client')
+            client.disconnect()
 
 
 # ==================================================================================================
@@ -222,18 +228,19 @@ class Subscriber:
     def run(self, exit_on_failure: bool=False):
         """Start processing subscriptions by running the RabbitMQ client."""
         with subscriber(self._client, exit_on_failure) as channel:
-            for directly in self._directly:
-                self._client.receive_from(channel, directly.queue, directly.callback,
-                                          connection=self._client.connection, **directly.kwargs)
-            for broadcast in self._broadcasts:
-                self._client.from_broadcast(channel, broadcast.exchange, broadcast.callback,
-                                            connection=self._client.connection, **broadcast.kwargs)
-            for direct in self._directs:
-                self._client.from_direct(channel, direct.exchange, direct.routing, direct.callback,
-                                         connection=self._client.connection, **direct.kwargs)
-            for topic in self._topics:
-                self._client.from_topic(channel, topic.exchange, topic.routing, topic.callback,
-                                        connection=self._client.connection, **topic.kwargs)
+            if channel:
+                for directly in self._directly:
+                    self._client.receive_from(channel, directly.queue, directly.callback,
+                                              connection=self._client.connection, **directly.kwargs)
+                for broadcast in self._broadcasts:
+                    self._client.from_broadcast(channel, broadcast.exchange, broadcast.callback,
+                                                connection=self._client.connection, **broadcast.kwargs)
+                for direct in self._directs:
+                    self._client.from_direct(channel, direct.exchange, direct.routing, direct.callback,
+                                             connection=self._client.connection, **direct.kwargs)
+                for topic in self._topics:
+                    self._client.from_topic(channel, topic.exchange, topic.routing, topic.callback,
+                                            connection=self._client.connection, **topic.kwargs)
 
 
 # ==================================================================================================

@@ -34,7 +34,8 @@ def callback(ch, method, properties, body):
     sent_to(ch, 'outgoing-queue', 'a-message')
 
 with subscriber(client) as channel:
-    client.receive_from(channel, 'incoming-queue', callback)
+    if channel:
+        client.receive_from(channel, 'incoming-queue', callback)
 ```
 
 Advanced use of the client

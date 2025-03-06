@@ -31,7 +31,7 @@ with open('requirements.txt', 'r', encoding='utf-8') as rf:
 setup(
     name=PACKAGE_NAME,
     version=VERSION,
-    author='CERTH',
+    author='giannopoulos',
     author_email='author@email.com',
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,

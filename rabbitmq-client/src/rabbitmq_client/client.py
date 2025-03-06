@@ -76,23 +76,35 @@ def is_callback_threaded(callback, threaded, ack, **kwargs):
 # Classes
 # ==================================================================================================
 #
-class RabbitMQClient:
+class Properties:
+    """Constructs RabbitMQ delivery properties"""
 
-    def __init__(self, host, port, username=None, password=None, verbose: bool = True):
+    def __new__(self, durable: bool = False, correlation_id=None, reply_to=None, **kwargs):
+        delivery_mode = pika.DeliveryMode.Persistent if durable else pika.DeliveryMode.Transient
+        return pika.BasicProperties(delivery_mode=delivery_mode,
+                                    correlation_id=correlation_id,
+                                    reply_to=reply_to)
+
+
+class RabbitMQClient:
+    """Represents a RabbitMQ Client"""
+
+    def __init__(self, host, port, username=None, password=None, tls: bool = False, verbose: bool = True):
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.tls = tls
         self.ssl_options = None
         # If port is SSL one then connect with SSL enabled
-        if self.port == 5671:
+        if tls:
             context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
             self.ssl_options = pika.SSLOptions(context)
         self.connection = None
         self.channel = None
         self.connected = False
+        self.verbose = verbose
         if not verbose:
-            self.verbose = verbose
             logging.getLogger('pika').setLevel(logging.WARNING)
 
     # -------------------------------------
@@ -102,8 +114,9 @@ class RabbitMQClient:
         """Connects to the RabbitMQ server, retrying on failure"""
         max_retries, attempts = 3, 0
         while not self.connected and attempts < max_retries:
+            attempts += 1
             try:
-                credentials=PlainCredentials(self.username, self.password)
+                credentials = PlainCredentials(self.username, self.password)
                 connection_parameters = pika.ConnectionParameters(host=self.host,
                                                                   port=self.port,
                                                                   credentials=credentials,
@@ -112,12 +125,13 @@ class RabbitMQClient:
                 self.channel = self.connection.channel()
                 self.connected = True
                 break
-            except pika.exceptions.ConnectionClosed:
-                attempts += 1
-                if attempts < max_retries:
+            except Exception as e:
+                logger.error(e)
+                if attempts <= max_retries:
                     logger.info(f"Connection attempt failed. Retrying in 1 second ({attempts}/{max_retries})")
                     time.sleep(1)
-                else:
+            finally:
+                if attempts == max_retries and not self.connected:
                     raise ConnectionError("Failed to connect to RabbitMQ after all retries")
 
     def disconnect(self):
@@ -173,6 +187,19 @@ class RabbitMQClient:
             # log and/or do something that makes sense for your app in this case.
             pass
 
+    @staticmethod
+    def nack_message(channel, delivery_tag):
+        """Send manually an Negative ACK to the broker
+        NOTE: Channel must be the same pika channel instance via which the message being negative
+              ACKed was retrieved (AMQP protocol constraint).
+        """
+        if channel.is_open:
+            channel.basic_nack(delivery_tag, requeue=False)
+        else:
+            # Channel is already closed, so we can't negative ACK this message;
+            # log and/or do something that makes sense for your app in this case.
+            pass
+
     #
     # Sent Messages
     #
@@ -186,6 +213,8 @@ class RabbitMQClient:
         queue (str): The name of the queue that receives the messages to be published
         message (str): The published message
         durable (boolean): If True, the broker will not remove the queue in case of a restart
+        reply_to (str): A queue to reply to
+        correlation_id (str): An ID to match the delivery on reply
 
         Usage examples
         --------------
@@ -194,13 +223,12 @@ class RabbitMQClient:
         # NOTE: By default, it operates using Round-Robin dispatching.
         if queue is None or queue == '':
             raise Exception('In direct queues, queues must be named!')
-        if durable:
-            kwargs.update({'properties': pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent)})
         channel.queue_declare(queue=queue, durable=durable)
-        channel.basic_publish(exchange='', routing_key=queue, body=message, **kwargs)
+        channel.basic_publish(exchange='', routing_key=queue, body=message, properties=Properties(durable=durable,
+                                                                                                  **kwargs))
 
     @staticmethod
-    def broadcast_to(channel, exchange: str, message: str):
+    def broadcast_to(channel, exchange: str, message: str, **kwargs):
         """Broadcast messages to multiple consumers
 
         Parameters
@@ -208,6 +236,8 @@ class RabbitMQClient:
         channel (rabbitMQ): A rabbitMQ communication channel between client and broker
         exchange (str): The name of the exchange that publishes the messages
         message (str): The published message
+        reply_to (str): A queue to reply to
+        correlation_id (str): An ID to match the delivery on reply
 
         Usage examples
         --------------
@@ -216,10 +246,10 @@ class RabbitMQClient:
         if exchange is None or exchange == '':
             raise Exception('In fanout, exchange must be named!')
         channel.exchange_declare(exchange=exchange, exchange_type='fanout')
-        channel.basic_publish(exchange=exchange, routing_key='', body=message)
+        channel.basic_publish(exchange=exchange, routing_key='', body=message, properties=Properties(**kwargs))
 
     @staticmethod
-    def direct_to(channel, exchange: str, routing: str, message: str):
+    def direct_to(channel, exchange: str, routing: str, message: str, **kwargs):
         """Delivers messages to multiple queues
 
         Parameters
@@ -228,6 +258,8 @@ class RabbitMQClient:
         exchange (str): The name of the exchange that publishes the messages
         routing (str): The name of the queue that listen for the expected messages
         message (str): The published message
+        reply_to (str): A queue to reply to
+        correlation_id (str): An ID to match the delivery on reply
 
         Usage examples
         --------------
@@ -238,10 +270,10 @@ class RabbitMQClient:
         if routing is None or routing == '':
             raise Exception('In direct, routing must be named!')
         channel.exchange_declare(exchange=exchange, exchange_type='direct')
-        channel.basic_publish(exchange=exchange, routing_key=routing, body=message)
+        channel.basic_publish(exchange=exchange, routing_key=routing, body=message, properties=Properties(**kwargs))
 
     @staticmethod
-    def topic_to(channel, exchange: str, routing: str, message: str):
+    def topic_to(channel, exchange: str, routing: str, message: str, **kwargs):
         """Delivers messages to multiple queues based on pattern
 
         Parameters
@@ -250,6 +282,8 @@ class RabbitMQClient:
         exchange (str): The name of the exchange that broadcasts the messages to be consumed
         routing (str): A string of words, delimited by dots
         message (str): The published message
+        reply_to (str): A queue to reply to
+        correlation_id (str): An ID to match the delivery on reply
 
         Usage examples
         --------------
@@ -263,7 +297,7 @@ class RabbitMQClient:
         if routing is None or routing == '':
             raise Exception('In topic, routing must be named!')
         channel.exchange_declare(exchange=exchange, exchange_type='topic')
-        channel.basic_publish(exchange=exchange, routing_key=routing, body=message)
+        channel.basic_publish(exchange=exchange, routing_key=routing, body=message, properties=Properties(**kwargs))
 
     #
     # Receive Messages

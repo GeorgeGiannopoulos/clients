@@ -52,12 +52,14 @@ import re
 import logging
 import datetime
 import warnings
+from typing import Iterable
 # Installed
+import pandas as pd
 from influxdb_client import InfluxDBClient, Point, Dialect
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS, WriteOptions
 from influxdb_client.client.warnings import MissingPivotFunction
 # Custom
-# NOTE: Add her all the Custom modules
+from influx_client.utilities import df_int_to_float
 
 
 # ==================================================================================================
@@ -84,8 +86,15 @@ RETRY_INTERVAL = 5_000   # The number of milliseconds to retry unsuccessful writ
 # Classes
 # ==================================================================================================
 #
+class InfluxPoint(Point):
+    """Extends InfluxDB Point."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
 class InfluxConverter:
-    """Converts data to InfluxDB.
+    """Converts data to InfluxDB Point.
 
     Parameters
     ----------
@@ -101,31 +110,22 @@ class InfluxConverter:
         self.fields = fields
         self.time = time
 
-    def toPoint(self):
+    def toPoint(self, force_float: bool = True) -> InfluxPoint:
         """Converts data to InfluxDB point.
 
         Returns
         -------
-        Point: An InfluxDB Point object.
+        InfluxPoint: An InfluxDB Point object.
         """
-        point = Point(self.measurements)
+        point = InfluxPoint(self.measurements)
         for tag, value in self.tags.items():
             point = point.tag(tag, value)
         for field, value in self.fields.items():
+            # Convert integers values to float by default
+            if isinstance(value, int) and not isinstance(value, bool) and force_float:
+                value = float(value)
             point = point.field(field, value)
         return point.time(self.time)
-
-    def toLine(self):
-        """Converts data to InfluxDB line protocol.
-
-        Returns
-        -------
-        str: A string representing the data in InfluxDB line protocol format.
-        """
-        tags = ','.join([f"{tag}={value}" for tag, value in self.tags.items()])
-        fields = ','.join([f"{field}={value}" for field, value in self.fields.items()])
-        time = int(datetime.datetime.strptime(self.time, DATE_IN_ISO).timestamp())
-        return f"{self.measurements},{tags} {fields} {time}000000000"
 
 
 class InfluxQuery:
@@ -149,9 +149,17 @@ class InfluxQuery:
         """Building the statement string"""
         return f'r["{key}"] == "{value}"'
 
+    def _pattern(self, key: str, value: str | int | float):
+        """Building the pattern string"""
+        return f'r["{key}"] =~ /{value}/'
+
     def _or(self, key: str, values: list):
         """Concatenate statement strings with or"""
         return ' or '.join([self._statement(key, value) for value in values])
+
+    def _pipe(self, key: str, values: list):
+        """Concatenate statement strings with pattern"""
+        return self._pattern(key, '|'.join(values))
 
     def _filter(self, by: str):
         """Build the filtering string"""
@@ -175,27 +183,28 @@ class InfluxQuery:
         ----------
         start (str[optional]): The start time of the range in ISO format.
         end (str[optional]): The end time of the range in ISO format.
-        past (str[optional]): Specify a past time range in minutes or days (e.g., '1h', '7d').
+        past (str[optional]): Specify a past time range in minutes, hours or days (e.g., '5h', '1h', '7d').
         """
-        end = datetime.datetime.strptime(end, DATE_IN_ISO) if end else datetime.datetime.now(datetime.UTC)
-        start = datetime.datetime.strptime(start, DATE_IN_ISO) if start else end - datetime.timedelta(minutes=525600)
         if past:
-            end = datetime.datetime.now(datetime.UTC)
-            # Match pattern of [0-9]m or [0-9]d
-            match = re.findall(r'(\d+)([md])', past)[0]
+            # Match pattern of [0-9]m, [0-9]h or [0-9]d
+            match = re.search(r'(\d+)([mhd])', past)
             if match:
-                number, unit = int(match[0]), match[1]
-                # Convert days to minutes
-                if unit == 'd':
-                    number = 1440 * number
-                minutes = number
+                number, unit = int(match.group(1)), match.group(2)
+                self._query += f'\n |> range(start: -{number}{unit})'
             else:
                 minutes = 525600  # Default to 1 year if not found
-            # Found start timestamp based on minutes
-            start = end - datetime.timedelta(minutes=minutes)
-        start = start.strftime(DATE_IN_ISO)
-        end = end.strftime(DATE_IN_ISO)
-        self._query += f'\n |> range(start: {start}, stop: {end})'
+                self._query += f'\n |> range(start: -{minutes}m)'
+        else:
+            include_stop = False if end is None else True
+            end = datetime.datetime.strptime(end, DATE_IN_ISO) + datetime.timedelta(milliseconds=1)\
+                if end else datetime.datetime.now(datetime.UTC)
+            start = datetime.datetime.strptime(start, DATE_IN_ISO) if start else end - datetime.timedelta(minutes=525600)
+            start = start.strftime(DATE_IN_ISO)
+            end = end.strftime(DATE_IN_ISO)
+            if include_stop:
+                self._query += f'\n |> range(start: {start}, stop: {end})'
+            else:
+                self._query += f'\n |> range(start: {start})'
         return self
 
     def measurement(self, measurement: str):
@@ -234,7 +243,11 @@ class InfluxQuery:
             if not isinstance(values, list):
                 values = [values]
             self._tags.append(field)
-            self._query += self._filter(self._or(field, values))
+            # HACK: if values length is larger than 169 it breaks the query, so use pattern instead
+            if len(values) > 150:
+                self._query += self._filter(self._pipe(field, values))
+            else:
+                self._query += self._filter(self._or(field, values))
         return self
 
     def method(self, method: str):
@@ -313,17 +326,76 @@ class InfluxQuery:
         self._query += f'\n |> first()'
         return self
 
+    def limit(self, n: int = 10, offset: int = 0):
+        """Limits each output table to the first n rows.
+
+        Parameters
+        ----------
+        n (int): Maximum number of rows to output.
+        offset (int): Number of records to skip from the start of a table before limiting to n. Default is 0.
+        """
+        self._query += f'\n |> limit(n: {n}, offset: {offset})'
+        return self
+
+    def tail(self, n: int, offset: int = 0):
+        """Limits each output table to the last n rows.
+
+        Parameters
+        ----------
+        n (int): Maximum number of rows to output.
+        offset (int): Number of records to skip at the end of a table before limiting to n. Default is 0.
+        """
+        self._query += f'\n |> tail(n: {n}, offset: {offset})'
+        return self
+
+    def sort(self, columns: list = ['_time'], desc: bool = False):
+        """Orders rows in each input table based on values in specified columns.
+
+        Parameters
+        ----------
+        columns (list): List of columns to sort by. Default is ["_time"]. Sort precedence is determined by list order (left to right).
+        mode (str): Sort results in descending order. Default is false.
+        """
+        _ = ', '.join([f'"{col}"' for col in columns])
+        self._query += f'\n |> sort(columns: [{_}], desc: {str(desc).lower()})'
+        return self
+
+    def sum(self, column: str = '_value'):
+        """Returns the sum of non-null values in a specified column.
+
+        Parameters
+        ----------
+        column (str): Column to operate on. Default is _value.
+        """
+        self._query += f'\n |> sum(column: "{column}")'
+        return self
+
+    def toFloat(self):
+        """Converts all values in the _value column to float types."""
+        self._query += f'\n |> toFloat()'
+        return self
+
+    def toString(self):
+        """Converts all values in the _value column to string types."""
+        self._query += f'\n |> toString()'
+        return self
+
+    def group(self, columns: list = [], mode: str = None):
+        """Defines the group key for output tables, i.e. grouping records based on values for specific columns.
+
+        Parameters
+        ----------
+        columns (list): The list of columns to include or exclude (depending on the mode) in the grouping operation.
+        mode (str): The method used to define the group and resulting group key. Possible values include by and except.
+        """
+        _ = ', '.join([f'"{col}"' for col in columns])
+        mode = mode if mode in ['by', 'except'] else 'by'
+        self._query += f'\n |> group(columns: [{_}], mode: "{mode}")'
+        return self
+
     def pivot(self):
         """Pivot data specific columns."""
         self._query += f'\n |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")'
-        return self
-
-    def keep(self, fields: list):
-        """Which Pivot data to keep."""
-        _ = ', '.join(['"_time"'] +
-                      [f'"{tag}"' for tag in self._tags] +
-                      [f'"{field}"' for field in self._fields if field in fields])
-        self._query += f'\n |> keep(columns: [{_}])'
         return self
 
     def query(self):
@@ -381,7 +453,9 @@ class InfluxClient:
     def query(self, bucket: str, measurement: str, fields: str | list = None, method: str = None,
               start: str = None, end: str = None, past: str = None, integral: dict = None,
               aggregate_window: dict = None, window: dict = None, fill: dict = None,
-              last: dict = None, first: dict = None, pivot: bool = False, keep: list = None, **tags):
+              last: bool = False, first: bool = False, limit: dict = None, tail: dict = None,
+              sort: dict = None, toFloat: bool = False, toString: bool = False, group: dict = None,
+              pivot: bool = False, sum: dict = None, **tags):
         """ Build and execute a query.
 
         Parameters
@@ -400,10 +474,16 @@ class InfluxClient:
                                            each window.
         window (optional[dict]): Groups records using regular time intervals.
         fill (optional[dict]): Replaces all null values in input tables with a non-null value.
-        last (optional[dict]): Returns the last row with a non-null value from each input table.
-        first (optional[dict]): Returns the first non-null record from each input table.
+        last (optional[bool]): Returns the last row with a non-null value from each input table.
+        first (optional[bool]): Returns the first non-null record from each input table.
+        limit (optional[dict]): Returns the first n records from each input table.
+        tail (optional[dict]): Returns the last n records from each input table.
+        sort (optional[dict]): Orders rows in each input table based on values in specified columns.
+        toFloat (optional[bool]): Converts all values in the _value column to float types
+        toString (optional[bool]): Converts all values in the _value column to string types
+        group (optional[dict]): Defines the group key for output tables.
         pivot (optional[bool]): Whether to pivot the query result.
-        keep (optional[list[str]]): List of fields to keep in pivot.
+        sum (optional[dict]): Returns the sum of non-null values in a specified column.
         **tags: Additional tags as tag-key pairs to filter by.
 
         Returns
@@ -432,21 +512,34 @@ class InfluxClient:
             q = q.aggregate_window(**aggregate_window)
         if fill is not None:
             q = q.fill(**fill)
-        if last is not None:
-            q = q.last(**last)
-        if first is not None:
-            q = q.first(**first)
         if pivot:
             q = q.pivot()
-            if keep:
-                q = q.keep(keep)
+        if toFloat:
+            q = q.toFloat()
+        if toString:
+            q = q.toString()
+        if group is not None:
+            q = q.group(**group)
+        if sort is not None:
+            q = q.sort(**sort)
+        if limit is not None:
+            q = q.limit(**limit)
+        if last:
+            q = q.last()
+        if first:
+            q = q.first()
+        if tail is not None:
+            q = q.tail(**tail)
+        if sum is not None:
+            q = q.group()
+            q = q.sum(**sum)
         return q.query()
 
     # -------------------------------------
     # Read
     # -------------------------------------
     def read(self, bucket: str, measurement: str, fields: str | list = None, method: str = None,
-             format='line', pivot=False, **kwargs):
+             format='line', pivot=None, **kwargs):
         """Read data from influxDB
 
         Parameters
@@ -469,8 +562,9 @@ class InfluxClient:
         """
         # Control pivot argument
         if format == 'dataframe':
-            if not any(fun in kwargs for fun in ['window', 'integral', 'interpolate', 'fill', 'last', 'first']):
-                pivot = True
+            # Change the default pivot value from None to True if the above statement is True
+            if not any(fun in kwargs for fun in ['window', 'integral', 'interpolate', 'fill', 'last', 'first', 'tail']):
+                pivot = True if pivot is None else pivot
         kwargs['pivot'] = pivot
         # Build query
         query = self.query(bucket, measurement, fields, method, **kwargs)
@@ -488,38 +582,47 @@ class InfluxClient:
     # -------------------------------------
     # Write
     # -------------------------------------
-    def write(self, bucket: str, data, **kwargs):
+    def _valid_write(self, data):
+        """Valid write input is DataFrame or Extended InfluxPoint or a list of them"""
+        valid_types = (pd.DataFrame, InfluxPoint)
+        # Check if `data` is a single valid instance
+        if isinstance(data, valid_types):
+            return  True
+        # Check if `data` is an iterable containing only valid instances
+        if isinstance(data, Iterable) and all(isinstance(d, valid_types) for d in data):
+            return  True
+        # Raise an error if `data` is not a valid type or iterable of valid types
+        raise TypeError('Input must be a pandas.DataFrame, InfluxPoint, or an iterable of these types.')
+
+    def write(self, bucket: str, data, force_float: bool = True, **kwargs):
         """Write data to influxDB
 
         Parameters
         ----------
         bucket (str): The name of the bucket to stored the data
         data (...): One of the following formats
-            1. Line Protocol formatted as string
-            2. Line Protocol formatted as byte array
-            3. Dictionary-style object
-            4. Data Point
-            5. pandas DataFrame
+            1. Data Point
+            2. pandas DataFrame
+        force_float (bool): Disables the convertion of integers inside DataFrame to Float
 
         Usage examples
         --------------
-        >>> .write('Forecast', "SmartMeter,asset_id=0000011 power=20.0,energy=5.0 1")
-        >>> .write('Forecast', "SmartMeter,asset_id=0000011 power=20.0,energy=5.0 1".encode())
-        >>> .write('Forecast', {
-                                    "measurement": "SmartMeter",
-                                    "tags": { "asset_id": "0000011" },
-                                    "fields": { "power": 20.0, "energy": 5 },
-                                    "time": 1
-                                })
-        from influxdb_client import InfluxDBClient, Point
-        >>> .write('Forecast', Point("SmartMeter").tag("asset_id", "0000011")
-                                                  .field("power", 4.0)
-                                                  .field("energy", 4.0)
-                                                  .time(4))
+        from influxdb_client import InfluxDBClient, InfluxConverter
+        >>> .write('Forecast', InfluxConverter(measurements="SmartMeter",
+                                               tags={"asset_id": "0000011"}
+                                               fields={"power": 4.0,
+                                                       "energy": 4.0},
+                                               time="2024-06-01 03:00:55.581094Z)
         >>> .write('Forecast', df, data_frame_measurement_name='SmartMeter',
                                    data_frame_tag_columns=['asset_id'],
                                    data_frame_timestamp_column='timestamp')
         """
+        # NOTE: Inputs was locked to specific data types to secure integer convertion to float
+        self._valid_write(data)
+
+        # Convert integers to floats, in case a DataFrame is given as data
+        if isinstance(data, pd.DataFrame) and force_float:
+            data = df_int_to_float(data, **kwargs)
         kwargs['data_frame_measurement_name'] = kwargs.pop('measurement', None)
         kwargs['data_frame_tag_columns'] = kwargs.pop('tags', None)
         kwargs['data_frame_timestamp_column'] = kwargs.pop('timestamp', None)

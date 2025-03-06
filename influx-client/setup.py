@@ -28,7 +28,7 @@ with open('requirements.txt', 'r', encoding='utf-8') as rf:
 setup(
     name='influx-client',
     version='0.0.1',
-    author='CERTH',
+    author='giannopoulos',
     author_email='author@email.com',
     description='A wrapper for a influxDB client',
     long_description=LONG_DESCRIPTION,
